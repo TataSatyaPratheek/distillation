@@ -2,6 +2,7 @@
 Phase 2: Student model training with cached teacher outputs.
 """
 import os
+import gc
 import logging
 import torch
 from pathlib import Path
@@ -263,7 +264,8 @@ def run_student_phase(
             
             for batch_idx, batch in enumerate(progress_bar):
                 # Move batch to device
-                batch = {k: v.to(student.device) for k, v in batch.items()}
+                batch = {k: v.to(student.device, non_blocking=True).detach().clone() 
+             for k, v in batch.items()}
                 
                 # Get student outputs
                 student_outputs = student.forward(
@@ -299,10 +301,18 @@ def run_student_phase(
                 
                 # Update progress bar
                 progress_bar.set_postfix({
-                    "loss": train_loss / num_train_steps,
-                    "lr": optimizer.param_groups[0]["lr"]
+                "loss": train_loss / num_train_steps,
+                "lr": optimizer.param_groups[0]["lr"],
+                "mem": f"{torch.cuda.memory_allocated() / 1e9:.1f}GB"  # Show memory usage
                 })
+        
+                # Explicit deletion to help garbage collection
+                del student_outputs, loss        
                 
+                # Periodic memory cleanup
+                if batch_idx % 5 == 0:
+                    clear_gpu_memory()
+                    
                 # Log metrics periodically
                 if batch_idx % 10 == 0:
                     progress_logger.log_metrics(

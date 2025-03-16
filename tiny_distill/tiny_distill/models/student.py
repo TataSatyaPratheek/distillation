@@ -424,24 +424,13 @@ class StudentModel:
         log_memory_stats("After student model unloading")
     
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        max_micro_batch: int = 1,
-        return_dict: bool = True
-    ) -> Any:
-        """
-        Memory-efficient forward pass for student model.
-        
-        Args:
-            input_ids (torch.Tensor): Input token IDs
-            attention_mask (Optional[torch.Tensor], optional): Attention mask. Defaults to None.
-            max_micro_batch (int, optional): Maximum micro-batch size. Defaults to 1.
-            return_dict (bool, optional): Whether to return dict. Defaults to True.
-        
-        Returns:
-            Any: Model outputs
-        """
+    self,
+    input_ids: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    max_micro_batch: int = 1,
+    return_dict: bool = True
+) -> Any:
+        """Memory-optimized forward pass with proper tensor lifecycle management."""
         if not self.loaded:
             logger.warning("Model not loaded, loading now")
             self.load_model()
@@ -476,10 +465,24 @@ class StudentModel:
                         return_dict=return_dict
                     )
                 
-                all_outputs.append(micro_outputs)
+                # Clone tensors to avoid reference issues
+                if return_dict:
+                    cloned_outputs = type(micro_outputs)(**{
+                        k: v.detach().clone() if isinstance(v, torch.Tensor) else v 
+                        for k, v in micro_outputs.items()
+                    })
+                    all_outputs.append(cloned_outputs)
+                else:
+                    cloned_outputs = tuple(
+                        t.detach().clone() if isinstance(t, torch.Tensor) else t 
+                        for t in micro_outputs
+                    )
+                    all_outputs.append(cloned_outputs)
                 
                 # Clear cache between micro-batches if in eval mode
                 if not self.model.training:
+                    # Explicitly delete to help garbage collection
+                    del device_inputs, micro_outputs
                     clear_gpu_memory()
             
             # Combine results (this depends on the model output format)
@@ -488,19 +491,26 @@ class StudentModel:
                 combined_outputs = {}
                 for key in all_outputs[0].keys():
                     if isinstance(all_outputs[0][key], torch.Tensor):
-                        # Clone the tensors before concatenation to avoid reference issues
-                        tensors_to_cat = [out[key].clone() for out in all_outputs]
+                        # Use cat instead of stack to avoid dimension issues
+                        tensors_to_cat = [out[key] for out in all_outputs]
                         combined_outputs[key] = torch.cat(tensors_to_cat, dim=0)
                     else:
                         # Handle non-tensor outputs (e.g., lists)
                         combined_outputs[key] = [item for out in all_outputs for item in out[key]]
                 
+                # Clean up intermediate results
+                del all_outputs, micro_batches
+                
                 return type(all_outputs[0])(**combined_outputs)
             else:
                 # Handle tuple outputs
                 combined_first = torch.cat([out[0] for out in all_outputs], dim=0)
+                
+                # Clean up intermediate results
+                del all_outputs, micro_batches
+                
                 return (combined_first,)
-            
+                
         else:
             # Single forward pass for small batches
             inputs = {

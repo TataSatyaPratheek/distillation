@@ -2,6 +2,7 @@
 Main entry point for ultra-low memory distillation.
 """
 import os
+import gc
 import sys
 import time
 import logging
@@ -11,19 +12,86 @@ from typing import Dict, Optional, List
 import argparse
 from tqdm import tqdm
 
-from .config import DistillationConfig
-from .logging_utils import setup_logging
-from .memory_utils import log_memory_stats, clear_gpu_memory, ensure_gpu_memory, MemoryTracker
-from .data.dataset import load_and_prepare_dataset
-from .data.caching import TeacherOutputCache, cache_teacher_outputs, TeacherCacheDataset
-from .models.teacher import TeacherModel
-from .models.student import StudentModel
-from .training.teacher_phase import run_teacher_phase
-from .training.student_phase import run_student_phase
+from tiny_distill.config import DistillationConfig
+from tiny_distill.logging_utils import setup_logging
+from tiny_distill.memory_utils import (
+    log_memory_stats, clear_gpu_memory, 
+    ensure_gpu_memory, MemoryTracker, 
+    prevent_tensor_fragmentation)
+from tiny_distill.logging_utils import setup_logging
+from tiny_distill.data.dataset import load_and_prepare_dataset
+from tiny_distill.data.caching import TeacherOutputCache, cache_teacher_outputs, TeacherCacheDataset
+from tiny_distill.models.teacher import TeacherModel
+from tiny_distill.models.student import StudentModel
+from tiny_distill.training.teacher_phase import run_teacher_phase
+from tiny_distill.training.student_phase import run_student_phase
 
 
 logger = logging.getLogger(__name__)
 
+
+
+def main_with_memory_optimizations():
+    """Memory-optimized entry point for TinyDistill."""
+    
+    # Set optimized CUDA memory allocator settings
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:32,garbage_collection_threshold:0.6,expandable_segments:True"
+    
+    # Disable auto-tuning for cudnn to save memory
+    torch.backends.cudnn.benchmark = False
+    
+    # Use deterministic algorithms
+    torch.backends.cudnn.deterministic = True
+    
+    # Limit memory fraction to avoid OOM
+    if torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(0.9)
+    
+    # Parse arguments
+    args = parse_arguments()
+    
+    # Set up logging
+    log_file = os.path.join(args.output_dir, "distillation.log")
+    os.makedirs(args.output_dir, exist_ok=True)
+    setup_logging(log_level=args.log_level, log_file=log_file)
+    
+    # Apply additional optimizations for GTX 1650 Ti
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        
+        print(f"Detected GPU: {gpu_name} with {vram_gb:.2f}GB VRAM")
+        
+        # For GTX 1650 Ti with ~4GB VRAM, adjust config automatically
+        if vram_gb < 4.5 and "1650" in gpu_name:
+            print("Applying optimized settings for GTX 1650 Ti")
+            
+            # Override arguments with optimized settings
+            args.teacher_batch = min(args.teacher_batch, 1)
+            args.student_batch = min(args.student_batch, 2)
+            args.sequence_length = min(args.sequence_length, 64)
+            args.gradient_checkpointing = True
+            args.cpu_offload = True
+            
+            # Enable more aggressive garbage collection
+            gc.set_threshold(100, 5, 2)  # More aggressive GC thresholds
+            
+            # Adjust samples for feasibility
+            if args.samples > 300:
+                print(f"Reducing samples from {args.samples} to 300 for memory efficiency")
+                args.samples = 300
+    
+    # Convert arguments to config with optimizations
+    config = DistillationConfig.from_args(args)
+    
+    # Clean memory before starting
+    clear_gpu_memory()
+    
+    # Log initial memory state
+    log_memory_stats("Initial (with optimizations)")
+    
+    # Run distillation with optimized config
+    run_distillation(config)
 
 def parse_arguments() -> argparse.Namespace:
     """
@@ -397,4 +465,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main_with_memory_optimizations()

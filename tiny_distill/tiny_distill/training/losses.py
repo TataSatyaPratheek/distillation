@@ -47,56 +47,51 @@ def masked_kl_divergence_loss(
     temperature: float = 2.0
 ) -> torch.Tensor:
     """
-    Knowledge distillation loss with masking for padding tokens.
-    
-    Args:
-        student_logits (torch.Tensor): Student model logits [batch_size, seq_len, vocab_size]
-        teacher_logits (torch.Tensor): Teacher model logits [batch_size, seq_len, vocab_size]
-        attention_mask (Optional[torch.Tensor], optional): Attention mask [batch_size, seq_len]. Defaults to None.
-        temperature (float, optional): Softmax temperature. Defaults to 2.0.
-        
-    Returns:
-        torch.Tensor: Masked KL divergence loss
+    Memory-optimized KL divergence loss with proper tensor management.
+    Processes sequence in chunks to avoid large memory spikes.
     """
     batch_size, seq_len, vocab_size = student_logits.shape
     
     # Apply temperature scaling
-    student_logits_scaled = student_logits / temperature
-    teacher_logits_scaled = teacher_logits / temperature
+    student_scaled = student_logits / temperature
+    teacher_scaled = teacher_logits / temperature
     
-    # Compute log softmax for student and softmax for teacher
-    log_probs_student = F.log_softmax(student_logits_scaled, dim=-1)
-    probs_teacher = F.softmax(teacher_logits_scaled, dim=-1)
+    # Process in chunks to avoid large memory allocations
+    chunk_size = min(256, seq_len)  # Process sequence in chunks
+    total_loss = 0.0
+    denom = 0.0
     
-    # Compute KL divergence (per token)
-    # kl_div expects input in log-space and target in probability space
-    kl_div = F.kl_div(log_probs_student.reshape(-1, vocab_size),
-                       probs_teacher.reshape(-1, vocab_size),
-                       reduction="none").sum(-1)
-    
-    # Reshape back to [batch_size, seq_len]
-    kl_div = kl_div.reshape(batch_size, seq_len)
-    
-    # Apply mask if provided
-    if attention_mask is not None:
-        # Ensure mask is binary and same device
-        mask = attention_mask.to(dtype=torch.bool, device=kl_div.device)
+    for i in range(0, seq_len, chunk_size):
+        end_idx = min(i + chunk_size, seq_len)
+        # Get current chunks
+        student_chunk = student_scaled[:, i:end_idx, :]
+        teacher_chunk = teacher_scaled[:, i:end_idx, :]
         
-        # Apply mask and compute mean over non-masked tokens
-        kl_div = kl_div * mask
-        num_tokens = mask.sum()
+        # Compute log softmax and softmax efficiently
+        log_probs = F.log_softmax(student_chunk, dim=-1)
+        probs = F.softmax(teacher_chunk, dim=-1)
         
-        # Avoid division by zero
-        if num_tokens > 0:
-            kl_div = kl_div.sum() / num_tokens
+        # Compute KL div without reshaping the entire tensor
+        kl_div_chunk = F.kl_div(log_probs, probs, reduction='none').sum(-1)
+        
+        # Apply mask if provided
+        if attention_mask is not None:
+            mask_chunk = attention_mask[:, i:end_idx].to(dtype=torch.bool)
+            kl_div_chunk = kl_div_chunk * mask_chunk
+            denom += mask_chunk.sum().item()  # Use .item() to avoid reference issues
         else:
-            kl_div = kl_div.sum()  # Will be zero if all tokens are masked
-    else:
-        # No mask, compute mean over all tokens
-        kl_div = kl_div.mean()
+            denom += batch_size * (end_idx - i)
+        
+        total_loss += kl_div_chunk.sum().item()  # Use .item() to avoid reference issues
+        
+        # Explicitly clear intermediates
+        del log_probs, probs, kl_div_chunk
+        torch.cuda.empty_cache()  # Clear CUDA cache after each chunk
     
-    # Scale by temperature squared (as in the original paper)
-    return kl_div * (temperature ** 2)
+    # Return loss as a fresh tensor to avoid reference issues
+    return torch.tensor(total_loss / max(denom, 1.0), 
+                       device=student_logits.device) * (temperature ** 2)
+
 
 
 def mse_loss(

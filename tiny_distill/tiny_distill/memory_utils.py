@@ -24,6 +24,58 @@ logger = logging.getLogger(__name__)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64,expandable_segments:True"
 
 
+def prevent_tensor_fragmentation():
+    """
+    Configure PyTorch to prevent memory fragmentation.
+    Call this at the start of your script.
+    """
+    # Set environment variables to help with fragmentation
+    if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:32,garbage_collection_threshold:0.6,expandable_segments:True"
+    
+    # Force cudnn to be deterministic to avoid non-deterministic algorithms
+    # that might use extra memory
+    torch.backends.cudnn.deterministic = True
+    
+    # Set memory fraction to be used (leave some for system)
+    if torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(0.85)
+    
+    logger.info("Memory fragmentation prevention configured")
+
+
+def slice_tensors(tensors: Dict[str, torch.Tensor], slice_size: int) -> List[Dict[str, torch.Tensor]]:
+    """
+    Memory-optimized version that properly handles tensor references.
+    
+    Args:
+        tensors (Dict[str, torch.Tensor]): Dictionary of tensors
+        slice_size (int): Size of each slice
+        
+    Returns:
+        List[Dict[str, torch.Tensor]]: List of sliced tensor dictionaries
+    """
+    batch_size = next(iter(tensors.values())).size(0)
+    slices = []
+    
+    for i in range(0, batch_size, slice_size):
+        # Create new dictionary with independent slices
+        slice_dict = {}
+        for k, v in tensors.items():
+            if isinstance(v, torch.Tensor):
+                # Create a proper copy with detach() and clone() to avoid reference issues
+                slice_dict[k] = v[i:i+slice_size].detach().clone()
+            else:
+                slice_dict[k] = v[i:i+slice_size]
+        slices.append(slice_dict)
+        
+        # Help garbage collector between iterations if we have many slices
+        if i > 0 and i % (3 * slice_size) == 0:
+            gc.collect()
+    
+    return slices
+
+
 @dataclass
 class MemoryStats:
     """Class for storing memory usage statistics."""
@@ -169,16 +221,28 @@ def log_memory_stats(prefix: str = "") -> MemoryStats:
         return get_memory_stats()
 
 
-def clear_gpu_memory() -> None:
-    """Force clear CUDA cache."""
-    try:
+def clear_gpu_memory(wait_for_completion=True) -> None:
+    """
+    Enhanced version that forces garbage collection and ensures CUDA operations complete.
+    
+    Args:
+        wait_for_completion (bool): Whether to wait for CUDA operations to complete
+    """
+    # First run Python's garbage collector aggressively
+    gc.collect()
+    
+    if torch.cuda.is_available():
+        if wait_for_completion:
+            # Wait for all CUDA operations to complete
+            torch.cuda.synchronize()
+        
+        # Clear CUDA cache
+        torch.cuda.empty_cache()
+        
+        # Run garbage collection again after clearing cache
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        logger.debug("GPU memory cleared")
-    except Exception as e:
-        logger.warning(f"Error clearing GPU memory: {e}")
-
+        
+    logger.debug("GPU memory cleared")
 
 def ensure_gpu_memory(required_gb: float) -> bool:
     """
