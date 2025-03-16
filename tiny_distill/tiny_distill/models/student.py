@@ -481,7 +481,18 @@ class StudentModel:
     max_micro_batch: int = 1,
     return_dict: bool = True
 ) -> Any:
-        """Memory-optimized forward pass with proper tensor lifecycle management."""
+        """
+        Memory-efficient forward pass for student model.
+        
+        Args:
+            input_ids (torch.Tensor): Input token IDs
+            attention_mask (Optional[torch.Tensor], optional): Attention mask. Defaults to None.
+            max_micro_batch (int, optional): Maximum micro-batch size. Defaults to 1.
+            return_dict (bool, optional): Whether to return dict. Defaults to True.
+        
+        Returns:
+            Any: Model outputs
+        """
         if not self.loaded:
             logger.warning("Model not loaded, loading now")
             self.load_model()
@@ -536,8 +547,15 @@ class StudentModel:
                     del device_inputs, micro_outputs
                     clear_gpu_memory()
             
+            # Ensure we have outputs to combine
+            if not all_outputs:
+                raise ValueError("No outputs generated from micro-batches")
+            
             # Combine results (this depends on the model output format)
             if return_dict:
+                # Save the type before we do anything with all_outputs
+                result_type = type(all_outputs[0])
+                
                 # Combine into a single output dict
                 combined_outputs = {}
                 for key in all_outputs[0].keys():
@@ -549,18 +567,24 @@ class StudentModel:
                         # Handle non-tensor outputs (e.g., lists)
                         combined_outputs[key] = [item for out in all_outputs for item in out[key]]
                 
-                # Clean up intermediate results
-                del all_outputs, micro_batches
+                # Create the result before cleanup
+                result = result_type(**combined_outputs)
                 
-                return type(all_outputs[0])(**combined_outputs)
+                # Clean up intermediate results
+                del all_outputs, micro_batches, combined_outputs
+                
+                return result
             else:
                 # Handle tuple outputs
                 combined_first = torch.cat([out[0] for out in all_outputs], dim=0)
                 
-                # Clean up intermediate results
-                del all_outputs, micro_batches
+                # Create the result before cleanup
+                result = (combined_first,)
                 
-                return (combined_first,)
+                # Clean up intermediate results
+                del all_outputs, micro_batches, combined_first
+                
+                return result
                 
         else:
             # Single forward pass for small batches
