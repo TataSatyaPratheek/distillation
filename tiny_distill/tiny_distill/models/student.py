@@ -280,7 +280,7 @@ class StudentModel:
             raise
 
     def add_lora(self) -> None:
-        """Add LoRA adapters to the model for memory-efficient fine-tuning."""
+        """Add LoRA adapters to the model for memory-efficient fine-tuning with proper gradient flow."""
         if not self.loaded:
             logger.warning("Model not loaded, loading now")
             self.load_model()
@@ -295,7 +295,7 @@ class StudentModel:
         if self.target_modules is None:
             self.target_modules = self.detect_target_modules()
 
-        # Create LoRA config
+        # Create LoRA config with explicit modules
         self.lora_config = LoraConfig(
             r=self.lora_rank,
             lora_alpha=self.lora_alpha,
@@ -305,40 +305,32 @@ class StudentModel:
             task_type=TaskType.CAUSAL_LM
         )
 
-        # First make sure model is in eval mode for adding LoRA
-        self.model.eval()
-
         # Add LoRA adapters
         self.model = get_peft_model(self.model, self.lora_config)
 
-        # Then explicitly switch to train mode
+        # Explicitly set training mode
         self.model.train()
 
-        # Make sure we've actually set requires_grad for LoRA parameters
-        trainable_params = 0
-        all_params = 0
-        for name, param in self.model.named_parameters():
-            all_params += param.numel()
-            if param.requires_grad:
-                trainable_params += param.numel()
-
-        if trainable_params == 0:
-            logger.error("No trainable parameters found after adding LoRA!")
-
-        # Try to force enable parameters that should be trainable
-        for name, param in self.model.named_parameters():
-            if any(target in name for target in self.target_modules):
-                if "lora" in name.lower():
-                    logger.info(f"Forcing trainability for {name}")
-                    param.requires_grad_(True)
-
-        self.is_lora = True
-
-        # Log parameter counts
+        # Verify trainable parameters
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.model.parameters())
+
+        if trainable_params == 0:
+            # Force enable training for LoRA parameters
+            logger.warning("No trainable parameters found after adding LoRA, manually enabling...")
+            for name, param in self.model.named_parameters():
+                if "lora" in name.lower():
+                    param.requires_grad_(True)
+                    logger.debug(f"Enabled gradients for {name}")
+
+            # Check again
+            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+
+        self.is_lora = True
         logger.info(f"Trainable parameters: {trainable_params:,} ({trainable_params / total_params:.2%} of total)")
 
+        # Verify the model is properly set up for training
+        self.setup_for_training()
         log_memory_stats("After adding LoRA adapters")
 
     def save_model(self, output_dir: str, save_full: bool = False) -> None:
@@ -499,20 +491,20 @@ class StudentModel:
         log_memory_stats("After student model unloading")
 
     def forward(
-    self,
-    input_ids: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-    max_micro_batch: int = 1,
-    return_dict: bool = True
-) -> Any:
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        max_micro_batch: int = 1,
+        return_dict: bool = True
+    ) -> Any:
         """
-        Memory-efficient forward pass for student model.
+        Memory-efficient forward pass for student model that preserves gradients.
 
         Args:
             input_ids (torch.Tensor): Input token IDs
-                        attention_mask (Optional[torch.Tensor], optional): Attention mask. Defaults to None.
+            attention_mask (Optional[torch.Tensor], optional): Attention mask. Defaults to None.
             max_micro_batch (int, optional): Maximum micro-batch size. Defaults to 1.
-            return_dict (bool, optional): Whether to return dict. Defaults to True.
+                        return_dict (bool, optional): Whether to return dict. Defaults to True.
 
         Returns:
             Any: Model outputs
@@ -520,6 +512,19 @@ class StudentModel:
         if not self.loaded:
             logger.warning("Model not loaded, loading now")
             self.load_model()
+
+        # Ensure model is in training mode to maintain gradients
+        if self.model.training:
+            for param in self.model.parameters():
+                if param.requires_grad:
+                    break
+            else:
+                logger.warning("No trainable parameters found, attempting to fix...")
+                self.model.train()
+
+            # Re-add LoRA if necessary
+            if not self.is_lora:
+                self.add_lora()
 
         # Get batch size
         batch_size = input_ids.size(0)
@@ -544,71 +549,34 @@ class StudentModel:
                 # Move to the right device
                 device_inputs = {k: v.to(self.model.device) for k, v in micro_batch.items()}
 
-                # Forward pass
-                with torch.set_grad_enabled(self.model.training):
-                    micro_outputs = self.model(
-                        **device_inputs,
-                        return_dict=return_dict
-                    )
+                # Forward pass - preserve requires_grad
+                micro_outputs = self.model(
+                    **device_inputs,
+                    return_dict=return_dict
+                )
 
-                # Clone tensors to avoid reference issues
-                if return_dict:
-                    cloned_outputs = type(micro_outputs)(**{
-                        k: v.detach().clone() if isinstance(v, torch.Tensor) else v
-                        for k, v in micro_outputs.items()
-                    })
-                    all_outputs.append(cloned_outputs)
-                else:
-                    cloned_outputs = tuple(
-                        t.detach().clone() if isinstance(t, torch.Tensor) else t
-                        for t in micro_outputs
-                    )
-                    all_outputs.append(cloned_outputs)
-
-                # Clear cache between micro-batches if in eval mode
-                if not self.model.training:
-                    # Explicitly delete to help garbage collection
-                    del device_inputs, micro_outputs
-                    clear_gpu_memory()
-
-            # Ensure we have outputs to combine
-            if not all_outputs:
-                raise ValueError("No outputs generated from micro-batches")
+                # Store the outputs without detaching
+                all_outputs.append(micro_outputs)
 
             # Combine results (this depends on the model output format)
             if return_dict:
-                # Save the type before we do anything with all_outputs
-                result_type = type(all_outputs[0])
-
                 # Combine into a single output dict
                 combined_outputs = {}
                 for key in all_outputs[0].keys():
                     if isinstance(all_outputs[0][key], torch.Tensor):
-                        # Use cat instead of stack to avoid dimension issues
+                        # Concatenate tensors
                         tensors_to_cat = [out[key] for out in all_outputs]
                         combined_outputs[key] = torch.cat(tensors_to_cat, dim=0)
                     else:
                         # Handle non-tensor outputs (e.g., lists)
                         combined_outputs[key] = [item for out in all_outputs for item in out[key]]
 
-                # Create the result before cleanup
-                result = result_type(**combined_outputs)
-
-                # Clean up intermediate results
-                del all_outputs, micro_batches, combined_outputs
-
-                return result
+                # Return combined outputs with same type
+                return type(all_outputs[0])(**combined_outputs)
             else:
                 # Handle tuple outputs
                 combined_first = torch.cat([out[0] for out in all_outputs], dim=0)
-
-                # Create the result before cleanup
-                result = (combined_first,)
-
-                # Clean up intermediate results
-                del all_outputs, micro_batches, combined_first
-
-                return result
+                return (combined_first,)
 
         else:
             # Single forward pass for small batches
