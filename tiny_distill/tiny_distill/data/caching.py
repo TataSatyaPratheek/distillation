@@ -131,11 +131,11 @@ class TeacherOutputCache:
                 time.sleep(0.1)
     
     def _write_to_main_cache(
-        self, 
-        index: int, 
-        tensor: Optional[torch.Tensor] = None,
-        temp_file: Optional[str] = None
-    ) -> None:
+    self, 
+    index: int, 
+    tensor: Optional[torch.Tensor] = None,
+    temp_file: Optional[str] = None
+) -> None:
         """
         Write a tensor to the main cache file.
         
@@ -188,7 +188,8 @@ class TeacherOutputCache:
                 if tensor is not None:
                     # Convert tensor to numpy if needed
                     if isinstance(tensor, torch.Tensor):
-                        tensor_np = tensor.cpu().numpy()
+                        # Detach tensor and perform a contiguous copy to ensure no reference issues
+                        tensor_np = tensor.detach().contiguous().cpu().numpy()
                     else:
                         tensor_np = tensor
                     
@@ -214,6 +215,7 @@ class TeacherOutputCache:
         except Exception as e:
             logger.error(f"Error writing to main cache: {e}")
             # Don't delete temp file on error, so we can retry
+
     
     def add(self, index: int, logits: torch.Tensor) -> None:
         """
@@ -227,8 +229,8 @@ class TeacherOutputCache:
             logger.debug(f"Example {index} already cached, skipping")
             return
         
-        # Convert to the right dtype and move to CPU
-        logits = logits.to(dtype=self.dtype).cpu()
+        # Convert to the right dtype, detach, and move to CPU as a contiguous copy
+        logits = logits.detach().to(dtype=self.dtype).contiguous().cpu()
         
         if self.background_writes:
             # For background writes, save to temp file first

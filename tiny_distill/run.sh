@@ -27,7 +27,7 @@ elif [ "$VRAM_SIZE" -lt 3000 ]; then
     COMMAND="--teacher EleutherAI/pythia-70m --student EleutherAI/pythia-70m --samples 200 --sequence_length 32 --teacher_batch 1 --student_batch 2 --gradient_accumulation 8 --cpu_offload --layer_by_layer --gradient_checkpointing"
 elif [ "$VRAM_SIZE" -lt 5000 ]; then
     echo "Limited GPU memory detected (~5GB). Using memory-optimized settings."
-    COMMAND="--teacher EleutherAI/pythia-160m --student EleutherAI/pythia-70m --samples 300 --sequence_length 64 --teacher_batch 1 --student_batch 4 --gradient_checkpointing"
+    COMMAND="--teacher EleutherAI/pythia-410m --student EleutherAI/pythia-70m --samples 300 --sequence_length 64 --teacher_batch 1 --student_batch 4 --gradient_checkpointing"
 else
     echo "Sufficient GPU memory detected. Using standard settings."
     COMMAND="--teacher EleutherAI/pythia-410m --student EleutherAI/pythia-70m --samples 1000 --sequence_length 128 --teacher_batch 2 --student_batch 8"

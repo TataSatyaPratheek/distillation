@@ -480,7 +480,14 @@ def slice_tensors(tensors: Dict[str, torch.Tensor], slice_size: int) -> List[Dic
         slices = []
         
         for i in range(0, batch_size, slice_size):
-            slice_dict = {k: v[i:i+slice_size] for k, v in tensors.items()}
+            # Create new dictionary with cloned slices to avoid reference issues
+            slice_dict = {}
+            for k, v in tensors.items():
+                if isinstance(v, torch.Tensor):
+                    # Use clone() to create a new tensor instead of a view
+                    slice_dict[k] = v[i:i+slice_size].clone()
+                else:
+                    slice_dict[k] = v[i:i+slice_size]
             slices.append(slice_dict)
         
         return slices
@@ -488,7 +495,6 @@ def slice_tensors(tensors: Dict[str, torch.Tensor], slice_size: int) -> List[Dic
         logger.warning(f"Error slicing tensors: {e}")
         # Return original tensors as a single slice
         return [tensors]
-
 
 def setup_memory_efficient_attention():
     """Set up memory efficient attention if xformers is available."""

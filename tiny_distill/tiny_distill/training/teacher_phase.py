@@ -121,11 +121,16 @@ def run_teacher_phase(
     # Create forward pass function for caching
     @torch.no_grad()
     def teacher_forward(input_ids, attention_mask=None):
-        return teacher.forward(
+        """Forward function that properly handles tensors."""
+        result = teacher.forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            max_micro_batch=config.teacher_batch_size  # FIXED: Use correct parameter name
+            max_micro_batch=config.teacher_batch_size
         )
+        # Return a clone to ensure we're not holding references to the original tensor
+        if isinstance(result, torch.Tensor):
+            return result.clone()
+        return result
     
     # Start caching
     logger.info(f"Running teacher forward pass on {len(train_dataset)} examples "
