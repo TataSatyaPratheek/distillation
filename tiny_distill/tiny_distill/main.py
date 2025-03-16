@@ -265,9 +265,9 @@ def validate_config(config: DistillationConfig) -> Dict[str, str]:
                     "Consider enabling --cpu_offload for better stability."
                 )
             
-            if config.teacher_batch > 1:
+            if config.teacher_batch_size > 1:  # FIXED: Use correct parameter name
                 warnings["teacher_batch_size"] = (
-                    f"Teacher batch size {config.teacher_batch} may be too large for {gpu_memory:.1f}GB GPU. "
+                    f"Teacher batch size {config.teacher_batch_size} may be too large for {gpu_memory:.1f}GB GPU. "  # FIXED: Use correct parameter name
                     "Consider using --teacher_batch 1."
                 )
             
@@ -277,9 +277,9 @@ def validate_config(config: DistillationConfig) -> Dict[str, str]:
                     "Consider using a smaller value like 64."
                 )
             
-            if config.student_batch > 2:
+            if config.student_batch_size > 2:  # FIXED: Use correct parameter name
                 warnings["student_batch_size"] = (
-                    f"Student batch size {config.student_batch} may be too large for {gpu_memory:.1f}GB GPU. "
+                    f"Student batch size {config.student_batch_size} may be too large for {gpu_memory:.1f}GB GPU. "  # FIXED: Use correct parameter name
                     "Consider using a smaller batch size like 2."
                 )
     
