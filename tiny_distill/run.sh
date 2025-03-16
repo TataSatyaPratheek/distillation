@@ -43,7 +43,7 @@ echo "=================================="
 python -m tiny_distill.main \
   $COMMAND \
   --dataset tatsu-lab/alpaca \
-  --epochs 2 \
-  --learning_rate 5e-5 \
+  --epochs 50 \
+  --learning_rate 5e-4 \
   --output_dir "./distill_results" \
   --log_level INFO

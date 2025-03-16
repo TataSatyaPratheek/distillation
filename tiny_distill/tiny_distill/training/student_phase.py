@@ -263,132 +263,112 @@ def run_student_phase(
             )
 
             for batch_idx, batch in enumerate(progress_bar):
-                # Move batch to device (properly preserving gradients)
-                batch = {k: v.to(student.device, non_blocking=True) for k, v in batch.items()}
-
-                # Ensure we're in training mode
-                student.model.train()
-
-                # Zero gradients before computation
-                optimizer.zero_grad(set_to_none=True)
-
-                # Get student outputs
-                student_outputs = student.forward(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    max_micro_batch=config.micro_batch_size
-                )
-
-                # Create a scalar tensor with gradients if student logits don't have them
-                # This is a workaround for cases where the model outputs don't have gradients
-                loss = None
                 try:
-                    # Try using our normal loss function first
+                    # Initialize loss value to track failures
+                    current_loss = None
+
+                    # Move batch to device
+                    batch = {k: v.to(student.device) for k, v in batch.items()}
+
+                    # Clear gradients at the beginning
+                    optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+
+                    # Get student outputs
+                    student_outputs = student.forward(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        max_micro_batch=config.micro_batch_size
+                    )
+
+                    # Compute loss
                     loss = distillation_loss(
                         student_logits=student_outputs.logits,
                         teacher_logits=batch["teacher_logits"],
                         attention_mask=batch["attention_mask"]
                     )
-                except Exception as e:
-                    logger.warning(f"Error in standard loss computation: {e}")
-                    logger.info("Using direct KL calculation as fallback")
 
-                    # Direct KL calculation that should work even without grad tensors
-                    # This creates a new computation graph with proper gradients
-                    student_logits = student_outputs.logits
-                    teacher_logits = batch["teacher_logits"].to(student_logits.device)
+                    # Scale loss for gradient accumulation
+                    if config.gradient_accumulation_steps > 1:
+                        loss = loss / config.gradient_accumulation_steps
 
-                    # Get log probabilities with temperature scaling
-                    temp = config.temperature
-                    s_logits = student_logits / temp
-                    t_logits = teacher_logits.detach() / temp
+                    # Track the current loss value (before backward which might fail)
+                    current_loss = loss.item()
 
-                    # Create log probs and probs
-                    log_probs = F.log_softmax(s_logits, dim=-1)
-                    probs = F.softmax(t_logits, dim=-1)
+                    # Backward pass
+                    loss.backward()
 
-                    # Force creation of computation graph if not log_probs.requires_grad:
-                    # Get trainable params to connect to graph
-                    trainable_params = [p for p in student.model.parameters() if p.requires_grad]
-                    if trainable_params:
-                        # Create computations that will force gradient connections
-                        param_sum = sum(p.sum() * 0 for p in trainable_params)
-                        log_probs = log_probs + param_sum
+                    # Update weights with gradient accumulation
+                    if ((batch_idx + 1) % config.gradient_accumulation_steps == 0) or (batch_idx == len(train_dataloader) - 1):
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
 
-                    # Compute KL div loss
-                    kl_div = F.kl_div(log_probs, probs, reduction="batchmean")
-                    loss = kl_div * (temp ** 2)
+                    # Track loss (now using current_loss which is guaranteed to be set)
+                    train_loss += current_loss * config.gradient_accumulation_steps
+                    num_train_steps += 1
+                    global_step += 1
 
-                # Scale loss for gradient accumulation
-                if config.gradient_accumulation_steps > 1:
-                    loss = loss / config.gradient_accumulation_steps
+                    # Update progress bar
+                    progress_bar.set_postfix({
+                        "loss": train_loss / max(num_train_steps, 1),
+                        "lr": optimizer.param_groups[0]["lr"]
+                    })
 
-                # Backward pass
-                loss.backward()
+                    # Log metrics periodically
+                    if batch_idx % 10 == 0:
+                        progress_logger.log_metrics(
+                            metrics={
+                                "train_loss": current_loss * config.gradient_accumulation_steps,
+                                "learning_rate": optimizer.param_groups[0]["lr"]
+                            },
+                            step=global_step
+                        )
 
-                # Update weights with gradient accumulation
-                if ((batch_idx + 1) % config.gradient_accumulation_steps == 0) or (batch_idx == len(train_dataloader) - 1):
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
+                    # Save checkpoint periodically
+                    if global_step % 100 == 0:
+                        checkpoint_path = checkpoint_dir / f"checkpoint-{global_step}"
+                        checkpoint_path.mkdir(exist_ok=True)
 
-                # Track loss
-                current_loss = loss.item() * config.gradient_accumulation_steps
-                train_loss += current_loss
-                num_train_steps += 1
-                global_step += 1
+                        # Save model
+                        student.save_model(str(checkpoint_path), save_full=False)
 
-                # Update progress bar
-                progress_bar.set_postfix({
-                    "loss": train_loss / num_train_steps,
-                    "lr": optimizer.param_groups[0]["lr"],
-                    "mem": f"{torch.cuda.memory_allocated() / 1e9:.1f}GB"
-                })
+                        # Save optimizer and scheduler
+                        torch.save(optimizer.state_dict(), checkpoint_path / "optimizer.bin")
+                        torch.save(lr_scheduler.state_dict(), checkpoint_path / "scheduler.bin")
 
-                # Explicit deletion to help garbage collection
-                del student_outputs, loss
+                        # Save progress
+                        torch.save(
+                            {"epoch": epoch, "step": global_step},
+                            checkpoint_path / "progress.bin"
+                        )
 
-                # Periodic memory cleanup
-                if batch_idx % 5 == 0:
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                        logger.info(f"Saved checkpoint at step {global_step}")
 
-                # Log metrics periodically
-                if batch_idx % 10 == 0:
-                    progress_logger.log_metrics(
-                        metrics={
-                            "train_loss": loss.item() * config.gradient_accumulation_steps,
-                            "learning_rate": optimizer.param_groups[0]["lr"]
-                        },
-                        step=global_step
-                    )
+                    # Clear memory periodically
+                    if batch_idx % 10 == 0:
+                        # Explicitly delete variables to help garbage collection
+                        del student_outputs
 
-                # Save checkpoint periodically
-                if global_step % 100 == 0:
-                    checkpoint_path = checkpoint_dir / f"checkpoint-{global_step}"
-                    checkpoint_path.mkdir(exist_ok=True)
+                        # Don't delete loss yet as we might need it
 
-                    # Save model
-                    student.save_model(str(checkpoint_path), save_full=False)
+                        # Force garbage collection
+                        clear_gpu_memory()
 
-                    # Save optimizer and scheduler
-                    torch.save(optimizer.state_dict(), checkpoint_path / "optimizer.bin")
-                    torch.save(lr_scheduler.state_dict(), checkpoint_path / "scheduler.bin")
+                except Exception as batch_error:
+                    logger.warning(f"Error processing batch {batch_idx}: {batch_error}")
 
-                    # Save progress
-                    torch.save(
-                        {"epoch": epoch, "step": global_step},
-                        checkpoint_path / "progress.bin"
-                    )
+                    # Skip this batch and continue with the next one
+                    continue
 
-                    logger.info(f"Saved checkpoint at step {global_step}")
-
-                # Clear memory periodically
-                if batch_idx % 20 == 0:
-                    clear_gpu_memory()
+                finally:
+                    # Clean up any remaining tensors
+                    if 'student_outputs' in locals():
+                        del student_outputs
+                    if 'loss' in locals():
+                        del loss
 
             # End of epoch
-            epoch_train_loss = train_loss / num_train_steps
+            epoch_train_loss = train_loss / max(num_train_steps, 1)  # Avoid division by zero
             logger.info(f"Epoch {epoch+1}/{config.num_epochs} - Train loss: {epoch_train_loss:.4f}")
 
             # Validation
@@ -406,32 +386,40 @@ def run_student_phase(
 
                 with torch.no_grad():
                     for batch in progress_bar:
-                        # Move batch to device
-                        batch = {k: v.to(student.device) for k, v in batch.items()}
+                        try:
+                            # Move batch to device
+                            batch = {k: v.to(student.device) for k, v in batch.items()}
 
-                        # Get student outputs
-                        student_outputs = student.forward(
-                            input_ids=batch["input_ids"],
-                            attention_mask=batch["attention_mask"],
-                            max_micro_batch=config.micro_batch_size
-                        )
+                            # Get student outputs
+                            student_outputs = student.forward(
+                                input_ids=batch["input_ids"],
+                                attention_mask=batch["attention_mask"],
+                                max_micro_batch=config.micro_batch_size
+                            )
 
-                        # Compute loss
-                        loss = distillation_loss(
-                            student_logits=student_outputs.logits,
-                            teacher_logits=batch["teacher_logits"],
-                            attention_mask=batch["attention_mask"]
-                        )
+                            # Compute loss
+                            val_batch_loss = distillation_loss(
+                                student_logits=student_outputs.logits,
+                                teacher_logits=batch["teacher_logits"],
+                                attention_mask=batch["attention_mask"]
+                            )
 
-                        # Track loss
-                        val_loss += loss.item()
-                        num_val_steps += 1
+                            # Track loss
+                            val_loss += val_batch_loss.item()
+                            num_val_steps += 1
 
-                        # Update progress bar
-                        progress_bar.set_postfix({"loss": val_loss / num_val_steps})
+                            # Update progress bar
+                            progress_bar.set_postfix({"loss": val_loss / max(num_val_steps, 1)})
+
+                            # Clean up
+                            del student_outputs, val_batch_loss
+
+                        except Exception as val_error:
+                            logger.warning(f"Error in validation batch: {val_error}")
+                            continue
 
                 # End of validation
-                epoch_val_loss = val_loss / num_val_steps
+                epoch_val_loss = val_loss / max(num_val_steps, 1)  # Avoid division by zero
                 logger.info(f"Epoch {epoch+1}/{config.num_epochs} - Validation loss: {epoch_val_loss:.4f}")
 
                 # Log validation metrics
