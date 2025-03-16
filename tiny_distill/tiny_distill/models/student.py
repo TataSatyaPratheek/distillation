@@ -167,44 +167,90 @@ class StudentModel:
             else:
                 self.tokenizer = tokenizer
             
-            # Configure model loading
-            device_map = "auto"
+            # Configure device mapping
             if self.use_cpu_offload:
-                # Force initial loading to CPU
-                device_map = {"": "cpu"}
+                # For CPU offloading, we need a specific device map
+                logger.info("Setting up CPU offloading")
+                device_map = "auto"
+            else:
+                device_map = "auto" if self.device == "cuda" else {"": "cpu"}
             
-            # Configure quantization
-            if self.device == "cuda" and self.use_4bit:
-                logger.info("Using 4-bit quantization")
-                quantization_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.float16,
-                    bnb_4bit_use_double_quant=self.use_nested_quant,
-                    bnb_4bit_quant_type="nf4"
-                )
+            # Load the model with appropriate settings based on constraints
+            if self.device == "cuda":
+                if self.use_4bit and self.use_cpu_offload:
+                    # 4-bit with CPU offloading needs specific config
+                    logger.info("Using 4-bit quantization with CPU offloading")
+                    quantization_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.float16,
+                        bnb_4bit_use_double_quant=self.use_nested_quant,
+                        bnb_4bit_quant_type="nf4",
+                        llm_int8_enable_fp32_cpu_offload=True  # Key fix for the error
+                    )
+                    
+                    # Try loading with 4-bit quantization and CPU offloading
+                    try:
+                        self.model = AutoModelForCausalLM.from_pretrained(
+                            self.model_id,
+                            quantization_config=quantization_config,
+                            device_map=device_map,
+                            torch_dtype=torch.float16,
+                            low_cpu_mem_usage=True
+                        )
+                    except Exception as e:
+                        # Fallback to 8-bit if 4-bit fails
+                        logger.warning(f"4-bit quantization with CPU offloading failed: {e}")
+                        logger.info("Falling back to 8-bit quantization")
+                        clear_gpu_memory()
+                        
+                        try:
+                            self.model = AutoModelForCausalLM.from_pretrained(
+                                self.model_id,
+                                load_in_8bit=True,
+                                device_map=device_map,
+                                torch_dtype=torch.float16,
+                                low_cpu_mem_usage=True
+                            )
+                        except Exception as e2:
+                            # Final fallback to fp16 with CPU offloading
+                            logger.warning(f"8-bit quantization failed: {e2}")
+                            logger.info("Falling back to FP16 with CPU offloading")
+                            clear_gpu_memory()
+                            
+                            self.model = AutoModelForCausalLM.from_pretrained(
+                                self.model_id,
+                                device_map=device_map,
+                                torch_dtype=torch.float16,
+                                low_cpu_mem_usage=True
+                            )
+                    
+                elif self.use_4bit:
+                    # Standard 4-bit quantization (no CPU offloading)
+                    logger.info("Using 4-bit quantization without CPU offloading")
+                    quantization_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.float16,
+                        bnb_4bit_use_double_quant=self.use_nested_quant,
+                        bnb_4bit_quant_type="nf4"
+                    )
+                    
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        self.model_id,
+                        quantization_config=quantization_config,
+                        device_map=device_map,
+                        torch_dtype=torch.float16,
+                        low_cpu_mem_usage=True
+                    )
                 
-                # Load model with 4-bit quantization
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_id,
-                    quantization_config=quantization_config,
-                    device_map=device_map,
-                    torch_dtype=torch.float16,
-                    low_cpu_mem_usage=True
-                )
-                
-                # Prepare for LoRA fine-tuning
-                self.model = prepare_model_for_kbit_training(self.model)
-                
-            elif self.device == "cuda":
-                # Use regular loading with torch.float16
-                logger.info("Using standard loading with fp16")
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_id,
-                    torch_dtype=torch.float16,
-                    device_map=device_map,
-                    low_cpu_mem_usage=True
-                )
-                
+                else:
+                    # Standard FP16 loading
+                    logger.info("Using standard FP16 loading")
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        self.model_id,
+                        device_map=device_map,
+                        torch_dtype=torch.float16,
+                        low_cpu_mem_usage=True
+                    )
             else:
                 # CPU-only loading
                 logger.info("Loading on CPU")
@@ -213,6 +259,11 @@ class StudentModel:
                     device_map={"": "cpu"},
                     low_cpu_mem_usage=True
                 )
+            
+            # If we loaded a quantized model, prepare it for LoRA training
+            if hasattr(self.model, "is_quantized") and getattr(self.model, "is_quantized", False):
+                logger.info("Preparing quantized model for kbit training")
+                self.model = prepare_model_for_kbit_training(self.model)
             
             # Enable gradient checkpointing if requested
             if self.gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):

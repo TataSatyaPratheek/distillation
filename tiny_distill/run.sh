@@ -1,11 +1,14 @@
 #!/bin/bash
 
 # Set environment variables for optimal memory usage on limited hardware
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:32,garbage_collection_threshold:0.6
+export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:32,garbage_collection_threshold:0.6,expandable_segments:True"
 export CUDA_VISIBLE_DEVICES=0
 
+# Disable JIT cache to avoid memory leaks
+export PYTORCH_JIT_USE_NNC_NOT_NVFUSER=1
+
 # Ensure proper CUDA memory handling
-export TRANSFORMERS_OFFLINE=0
+export TRANSFORMERS_OFFLINE=1
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
 # Install the package in development mode
