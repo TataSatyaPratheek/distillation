@@ -284,7 +284,7 @@ class DistillationDataset(torch.utils.data.Dataset):
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
-        Get dataset item.
+        Get dataset item with proper tensor handling for gradients.
         
         Args:
             idx (int): Item index
@@ -297,9 +297,10 @@ class DistillationDataset(torch.utils.data.Dataset):
         
         item = self.dataset[idx]
         
-        # Convert to tensors
+        # Convert to tensors properly using clone().detach() for gradient tracking
         tensor_item = {
-            k: torch.tensor(v) for k, v in item.items()
+            k: v.clone().detach() if isinstance(v, torch.Tensor) else torch.tensor(v, dtype=torch.long)
+            for k, v in item.items()
         }
         
         # Move to device if specified
@@ -309,6 +310,7 @@ class DistillationDataset(torch.utils.data.Dataset):
             }
         
         return tensor_item
+
 
 
 def create_dataloader(

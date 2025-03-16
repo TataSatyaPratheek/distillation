@@ -361,7 +361,7 @@ class CachedDistillationLoss(nn.Module):
         attention_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Forward pass.
+        Forward pass ensuring gradient flow.
         
         Args:
             student_logits (torch.Tensor): Student model logits
@@ -371,16 +371,46 @@ class CachedDistillationLoss(nn.Module):
         Returns:
             torch.Tensor: Distillation loss
         """
+        # Ensure student logits require grad and teacher logits don't
+        if not student_logits.requires_grad:
+            raise ValueError("Student logits must require gradients for training")
+        
         # Ensure teacher logits are on the same device as student logits
         if teacher_logits.device != student_logits.device:
             teacher_logits = teacher_logits.to(student_logits.device)
         
-        # Compute KL divergence loss
-        kl_loss = masked_kl_divergence_loss(
-            student_logits=student_logits,
-            teacher_logits=teacher_logits,
-            attention_mask=attention_mask,
-            temperature=self.temperature
-        )
+        # Make sure teacher_logits are detached to avoid gradient flow from them
+        teacher_logits = teacher_logits.detach()
         
-        return self.alpha * kl_loss
+        # Apply temperature scaling
+        student_scaled = student_logits / self.temperature
+        teacher_scaled = teacher_logits / self.temperature
+        
+        # Compute log softmax for student and softmax for teacher
+        log_probs_student = F.log_softmax(student_scaled, dim=-1)
+        probs_teacher = F.softmax(teacher_scaled, dim=-1)
+        
+        # Compute KL divergence loss with proper reduction
+        batch_size, seq_len, vocab_size = student_logits.shape
+        
+        # Process in smaller chunks for memory efficiency
+        kl_div = F.kl_div(
+            log_probs_student.reshape(-1, vocab_size),
+            probs_teacher.reshape(-1, vocab_size),
+            reduction="none"
+        ).sum(-1).reshape(batch_size, seq_len)
+        
+        # Apply mask if provided
+        if attention_mask is not None:
+            mask = attention_mask.to(dtype=torch.bool, device=kl_div.device)
+            kl_div = kl_div * mask
+            num_tokens = mask.sum().item()
+            if num_tokens > 0:
+                kl_div = kl_div.sum() / num_tokens
+            else:
+                kl_div = kl_div.sum()
+        else:
+            kl_div = kl_div.mean()
+        
+        # Scale by temperature squared
+        return self.alpha * kl_div * (self.temperature ** 2)
