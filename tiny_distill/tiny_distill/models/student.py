@@ -2,6 +2,7 @@
 Student model handling with memory-efficient training.
 """
 import os
+import json
 import logging
 import torch
 import torch.nn as nn
@@ -34,6 +35,23 @@ from ..memory_utils import (
 
 logger = logging.getLogger(__name__)
 
+
+def serialize_config(config):
+    """Convert a config object to a JSON-serializable dict."""
+    if hasattr(config, "to_dict"):
+        config_dict = config.to_dict()
+    else:
+        config_dict = {k: v for k, v in config.__dict__.items() 
+                      if not k.startswith("_")}
+    
+    # Convert any non-serializable types (like sets) to serializable ones
+    for key, value in config_dict.items():
+        if isinstance(value, set):
+            config_dict[key] = list(value)  # Convert set to list
+        elif hasattr(value, "to_dict") and callable(getattr(value, "to_dict")):
+            config_dict[key] = serialize_config(value)  # Handle nested objects
+    
+    return config_dict
 
 class StudentModel:
     """
@@ -275,7 +293,9 @@ class StudentModel:
             
             # Save LoRA config for reference
             with open(output_path / "lora_config.json", "w") as f:
-                f.write(self.lora_config.to_json_string())
+                # Use our robust serialization function
+                config_dict = serialize_config(self.lora_config)
+                json.dump(config_dict, f, indent=2)
                 
         else:
             # Save full model (much larger)
