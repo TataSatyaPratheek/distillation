@@ -488,7 +488,9 @@ class StudentModel:
                 combined_outputs = {}
                 for key in all_outputs[0].keys():
                     if isinstance(all_outputs[0][key], torch.Tensor):
-                        combined_outputs[key] = torch.cat([out[key] for out in all_outputs], dim=0)
+                        # Clone the tensors before concatenation to avoid reference issues
+                        tensors_to_cat = [out[key].clone() for out in all_outputs]
+                        combined_outputs[key] = torch.cat(tensors_to_cat, dim=0)
                     else:
                         # Handle non-tensor outputs (e.g., lists)
                         combined_outputs[key] = [item for out in all_outputs for item in out[key]]
