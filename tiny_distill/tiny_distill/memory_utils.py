@@ -7,10 +7,16 @@ import time
 import psutil
 import torch
 import numpy as np
+import warnings
+import threading
 from typing import Dict, Optional, Union, Tuple, List
 from dataclasses import dataclass
 import logging
 from contextlib import contextmanager
+
+# Suppress deprecation warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*torch.distributed.reduce_op.*")
 
 logger = logging.getLogger(__name__)
 
@@ -38,15 +44,19 @@ def get_gpu_memory() -> Tuple[float, float, float, float]:
     Returns:
         Tuple[float, float, float, float]: allocated, reserved, total, and free memory in GB
     """
-    if not torch.cuda.is_available():
+    try:
+        if not torch.cuda.is_available():
+            return 0.0, 0.0, 0.0, 0.0
+        
+        allocated = torch.cuda.memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9
+        free = total - reserved
+        
+        return allocated, reserved, total, free
+    except Exception as e:
+        logger.warning(f"Error getting GPU memory stats: {e}")
         return 0.0, 0.0, 0.0, 0.0
-    
-    allocated = torch.cuda.memory_allocated() / 1e9
-    reserved = torch.cuda.memory_reserved() / 1e9
-    total = torch.cuda.get_device_properties(0).total_memory / 1e9
-    free = total - reserved
-    
-    return allocated, reserved, total, free
 
 
 def get_tensor_memory_usage() -> Dict[str, Tuple[List[int], float]]:
@@ -56,18 +66,22 @@ def get_tensor_memory_usage() -> Dict[str, Tuple[List[int], float]]:
     Returns:
         Dict[str, Tuple[List[int], float]]: Dictionary mapping tensor names to their shapes and sizes
     """
-    if not torch.cuda.is_available():
+    try:
+        if not torch.cuda.is_available():
+            return {}
+        
+        tensor_stats = {}
+        for obj in gc.get_objects():
+            try:
+                if torch.is_tensor(obj) and obj.is_cuda:
+                    tensor_stats[f"tensor_{id(obj)}"] = (list(obj.size()), obj.element_size() * obj.nelement() / 1e6)
+            except Exception:
+                pass
+        
+        return tensor_stats
+    except Exception as e:
+        logger.warning(f"Error getting tensor memory usage: {e}")
         return {}
-    
-    tensor_stats = {}
-    for obj in gc.get_objects():
-        try:
-            if torch.is_tensor(obj) and obj.is_cuda:
-                tensor_stats[f"tensor_{id(obj)}"] = (list(obj.size()), obj.element_size() * obj.nelement() / 1e6)
-        except Exception:
-            pass
-    
-    return tensor_stats
 
 
 def get_memory_stats() -> MemoryStats:
@@ -77,28 +91,42 @@ def get_memory_stats() -> MemoryStats:
     Returns:
         MemoryStats: Dataclass containing memory statistics
     """
-    # GPU memory
-    gpu_allocated, gpu_reserved, gpu_total, gpu_free = get_gpu_memory()
-    
-    # System memory
-    ram = psutil.virtual_memory()
-    ram_used = ram.used / 1e9
-    ram_total = ram.total / 1e9
-    ram_free = ram.free / 1e9
-    
-    # Tensor memory
-    tensor_stats = get_tensor_memory_usage()
-    
-    return MemoryStats(
-        gpu_allocated=gpu_allocated,
-        gpu_reserved=gpu_reserved,
-        gpu_total=gpu_total,
-        gpu_free=gpu_free,
-        ram_used=ram_used,
-        ram_total=ram_total,
-        ram_free=ram_free,
-        gpu_tensors=tensor_stats
-    )
+    try:
+        # GPU memory
+        gpu_allocated, gpu_reserved, gpu_total, gpu_free = get_gpu_memory()
+        
+        # System memory
+        ram = psutil.virtual_memory()
+        ram_used = ram.used / 1e9
+        ram_total = ram.total / 1e9
+        ram_free = ram.free / 1e9
+        
+        # Tensor memory
+        tensor_stats = get_tensor_memory_usage()
+        
+        return MemoryStats(
+            gpu_allocated=gpu_allocated,
+            gpu_reserved=gpu_reserved,
+            gpu_total=gpu_total,
+            gpu_free=gpu_free,
+            ram_used=ram_used,
+            ram_total=ram_total,
+            ram_free=ram_free,
+            gpu_tensors=tensor_stats
+        )
+    except Exception as e:
+        logger.warning(f"Error getting memory stats: {e}")
+        # Return default values
+        return MemoryStats(
+            gpu_allocated=0.0,
+            gpu_reserved=0.0,
+            gpu_total=0.0,
+            gpu_free=0.0,
+            ram_used=0.0,
+            ram_total=0.0,
+            ram_free=0.0,
+            gpu_tensors={}
+        )
 
 
 def log_memory_stats(prefix: str = "") -> MemoryStats:
@@ -111,37 +139,45 @@ def log_memory_stats(prefix: str = "") -> MemoryStats:
     Returns:
         MemoryStats: Memory statistics
     """
-    stats = get_memory_stats()
-    
-    if prefix:
-        prefix = f"{prefix} - "
-    
-    logger.info(
-        f"{prefix}Memory - GPU: {stats.gpu_allocated:.2f}GB allocated, "
-        f"{stats.gpu_reserved:.2f}GB reserved, {stats.gpu_free:.2f}GB free | "
-        f"RAM: {stats.ram_used:.2f}GB used / {stats.ram_total:.2f}GB total"
-    )
-    
-    # Log the top 5 largest tensors if we're using significant GPU memory
-    if stats.gpu_allocated > 0.5 and stats.gpu_tensors:
-        top_tensors = sorted(
-            stats.gpu_tensors.items(), 
-            key=lambda x: x[1][1], 
-            reverse=True
-        )[:5]
+    try:
+        stats = get_memory_stats()
         
-        logger.debug("Top 5 largest tensors:")
-        for name, (shape, size_mb) in top_tensors:
-            logger.debug(f"  {name}: {shape}, {size_mb:.2f}MB")
-    
-    return stats
+        if prefix:
+            prefix = f"{prefix} - "
+        
+        logger.info(
+            f"{prefix}Memory - GPU: {stats.gpu_allocated:.2f}GB allocated, "
+            f"{stats.gpu_reserved:.2f}GB reserved, {stats.gpu_free:.2f}GB free | "
+            f"RAM: {stats.ram_used:.2f}GB used / {stats.ram_total:.2f}GB total"
+        )
+        
+        # Log the top 5 largest tensors if we're using significant GPU memory
+        if stats.gpu_allocated > 0.5 and stats.gpu_tensors:
+            top_tensors = sorted(
+                stats.gpu_tensors.items(), 
+                key=lambda x: x[1][1], 
+                reverse=True
+            )[:5]
+            
+            logger.debug("Top 5 largest tensors:")
+            for name, (shape, size_mb) in top_tensors:
+                logger.debug(f"  {name}: {shape}, {size_mb:.2f}MB")
+        
+        return stats
+    except Exception as e:
+        logger.warning(f"Error logging memory stats: {e}")
+        return get_memory_stats()
 
 
 def clear_gpu_memory() -> None:
     """Force clear CUDA cache."""
-    gc.collect()
-    torch.cuda.empty_cache()
-    logger.debug("GPU memory cleared")
+    try:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.debug("GPU memory cleared")
+    except Exception as e:
+        logger.warning(f"Error clearing GPU memory: {e}")
 
 
 def ensure_gpu_memory(required_gb: float) -> bool:
@@ -154,22 +190,26 @@ def ensure_gpu_memory(required_gb: float) -> bool:
     Returns:
         bool: True if enough memory is available after clearing cache, False otherwise
     """
-    if not torch.cuda.is_available():
+    try:
+        if not torch.cuda.is_available():
+            return False
+        
+        # First check
+        _, _, _, free_gb = get_gpu_memory()
+        
+        if free_gb >= required_gb:
+            return True
+        
+        # Try to free memory
+        clear_gpu_memory()
+        
+        # Check again
+        _, _, _, free_gb = get_gpu_memory()
+        
+        return free_gb >= required_gb
+    except Exception as e:
+        logger.warning(f"Error ensuring GPU memory: {e}")
         return False
-    
-    # First check
-    _, _, _, free_gb = get_gpu_memory()
-    
-    if free_gb >= required_gb:
-        return True
-    
-    # Try to free memory
-    clear_gpu_memory()
-    
-    # Check again
-    _, _, _, free_gb = get_gpu_memory()
-    
-    return free_gb >= required_gb
 
 
 def optimal_batch_size(
@@ -192,48 +232,52 @@ def optimal_batch_size(
     Returns:
         int: Optimal batch size
     """
-    if not torch.cuda.is_available() or device == "cpu":
-        # On CPU, memory is less of a concern, use a reasonable default
-        return max(1, max_batch_size // 2)
-    
-    # Get total GPU memory
-    _, _, total_memory, _ = get_gpu_memory()
-    
-    # Start with batch size of 1
-    batch_size = 1
-    
-    # Create a sample input
-    sample_input = torch.zeros((1,) + input_shape, device=device)
-    
-    # Record initial memory usage
-    initial_memory = torch.cuda.memory_allocated() / 1e9
-    
-    # Try a forward pass
     try:
-        with torch.no_grad():
-            _ = model(sample_input)
+        if not torch.cuda.is_available() or device == "cpu":
+            # On CPU, memory is less of a concern, use a reasonable default
+            return max(1, max_batch_size // 2)
         
-        # Measure memory usage for one sample
-        one_sample_memory = torch.cuda.memory_allocated() / 1e9 - initial_memory
+        # Get total GPU memory
+        _, _, total_memory, _ = get_gpu_memory()
         
-        # Memory available for batching
-        available_memory = total_memory * target_memory_usage - initial_memory
-        
-        # Calculate max batch size
-        calculated_batch_size = int(available_memory / one_sample_memory)
-        batch_size = min(max(1, calculated_batch_size), max_batch_size)
-        
-        logger.info(f"Estimated optimal batch size: {batch_size} (one sample uses {one_sample_memory:.2f}GB)")
-    except Exception as e:
-        logger.warning(f"Error during batch size estimation: {e}")
-        # If we can't estimate, be conservative
+        # Start with batch size of 1
         batch_size = 1
-    
-    # Clean up
-    del sample_input
-    clear_gpu_memory()
-    
-    return batch_size
+        
+        # Create a sample input
+        sample_input = torch.zeros((1,) + input_shape, device=device)
+        
+        # Record initial memory usage
+        initial_memory = torch.cuda.memory_allocated() / 1e9
+        
+        # Try a forward pass
+        try:
+            with torch.no_grad():
+                _ = model(sample_input)
+            
+            # Measure memory usage for one sample
+            one_sample_memory = torch.cuda.memory_allocated() / 1e9 - initial_memory
+            
+            # Memory available for batching
+            available_memory = total_memory * target_memory_usage - initial_memory
+            
+            # Calculate max batch size
+            calculated_batch_size = int(available_memory / one_sample_memory)
+            batch_size = min(max(1, calculated_batch_size), max_batch_size)
+            
+            logger.info(f"Estimated optimal batch size: {batch_size} (one sample uses {one_sample_memory:.2f}GB)")
+        except Exception as e:
+            logger.warning(f"Error during batch size estimation: {e}")
+            # If we can't estimate, be conservative
+            batch_size = 1
+        
+        # Clean up
+        del sample_input
+        clear_gpu_memory()
+        
+        return batch_size
+    except Exception as e:
+        logger.warning(f"Error estimating optimal batch size: {e}")
+        return 1  # Conservative default
 
 
 @contextmanager
@@ -250,23 +294,26 @@ def offload_modules(model: torch.nn.Module, module_names: List[str], device: str
     original_devices = {}
     modules = {}
     
-    # Move modules to target device
-    for name in module_names:
-        try:
-            module = dict(model.named_modules())[name]
-            original_devices[name] = next(module.parameters()).device
-            module.to(device)
-            modules[name] = module
-        except (KeyError, StopIteration) as e:
-            logger.warning(f"Couldn't offload module {name}: {e}")
-    
     try:
+        # Move modules to target device
+        for name in module_names:
+            try:
+                module = dict(model.named_modules())[name]
+                original_devices[name] = next(module.parameters()).device
+                module.to(device)
+                modules[name] = module
+            except (KeyError, StopIteration) as e:
+                logger.warning(f"Couldn't offload module {name}: {e}")
+        
         yield modules
     finally:
         # Move modules back to original devices
         for name, original_device in original_devices.items():
             if name in modules:
-                modules[name].to(original_device)
+                try:
+                    modules[name].to(original_device)
+                except Exception as e:
+                    logger.warning(f"Error restoring module {name} to original device: {e}")
 
 
 @contextmanager
@@ -279,17 +326,21 @@ def temporary_freeze(model: torch.nn.Module):
     """
     # Save original requires_grad states
     original_states = {}
-    for name, param in model.named_parameters():
-        original_states[name] = param.requires_grad
-        param.requires_grad_(False)
     
     try:
+        for name, param in model.named_parameters():
+            original_states[name] = param.requires_grad
+            param.requires_grad_(False)
+        
         yield model
     finally:
         # Restore original requires_grad states
         for name, param in model.named_parameters():
             if name in original_states:
-                param.requires_grad_(original_states[name])
+                try:
+                    param.requires_grad_(original_states[name])
+                except Exception as e:
+                    logger.warning(f"Error restoring requires_grad for {name}: {e}")
 
 
 class MemoryTracker:
@@ -306,36 +357,59 @@ class MemoryTracker:
         self.history = []
         self.running = False
         self.start_time = None
+        self._thread = None
     
     def start(self):
         """Start tracking memory."""
+        if self.running:
+            logger.warning("Memory tracker already running")
+            return
+            
         self.running = True
         self.start_time = time.time()
         self.history = []
-        self._track()
+        
+        # Start memory tracking in a separate thread
+        self._thread = threading.Thread(target=self._track_loop, daemon=True)
+        self._thread.start()
+        logger.debug("Memory tracker started")
     
     def stop(self):
         """Stop tracking memory."""
-        self.running = False
-    
-    def _track(self):
-        """Record current memory usage."""
         if not self.running:
             return
-        
-        stats = get_memory_stats()
-        elapsed = time.time() - self.start_time
-        
-        self.history.append((elapsed, stats))
-        
-        # Log if it's time
-        if len(self.history) == 1 or elapsed - self.history[-2][0] >= self.log_interval:
-            log_memory_stats(f"[{elapsed:.1f}s]")
-        
-        # Schedule next tracking
-        torch.cuda.synchronize()  # Ensure accurate timing
-        time.sleep(0.1)  # Small sleep to prevent excessive CPU usage
-        self._track()
+            
+        self.running = False
+        if self._thread:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        logger.debug("Memory tracker stopped")
+    
+    def _track_loop(self):
+        """Background thread to track memory usage."""
+        try:
+            while self.running:
+                stats = get_memory_stats()
+                elapsed = time.time() - self.start_time
+                
+                self.history.append((elapsed, stats))
+                
+                # Log if it's time
+                if len(self.history) == 1 or elapsed - self.history[-2][0] >= self.log_interval:
+                    log_memory_stats(f"[{elapsed:.1f}s]")
+                
+                # Sleep before next measurement
+                time.sleep(1.0)  # Check every second
+                
+                # Ensure we don't get stuck if CUDA context changes
+                if torch.cuda.is_available():
+                    try:
+                        torch.cuda.synchronize()
+                    except:
+                        pass
+        except Exception as e:
+            logger.error(f"Error in memory tracking thread: {e}")
+            self.running = False
     
     def summary(self) -> Dict:
         """
@@ -347,18 +421,27 @@ class MemoryTracker:
         if not self.history:
             return {}
         
-        gpu_allocated = [stats.gpu_allocated for _, stats in self.history]
-        ram_used = [stats.ram_used for _, stats in self.history]
-        
-        return {
-            "duration": self.history[-1][0],
-            "gpu_min": min(gpu_allocated),
-            "gpu_max": max(gpu_allocated),
-            "gpu_avg": sum(gpu_allocated) / len(gpu_allocated),
-            "ram_min": min(ram_used),
-            "ram_max": max(ram_used),
-            "ram_avg": sum(ram_used) / len(ram_used),
-        }
+        try:
+            gpu_allocated = [stats.gpu_allocated for _, stats in self.history]
+            ram_used = [stats.ram_used for _, stats in self.history]
+            
+            return {
+                "duration": self.history[-1][0],
+                "gpu_min": min(gpu_allocated),
+                "gpu_max": max(gpu_allocated),
+                "gpu_avg": sum(gpu_allocated) / len(gpu_allocated),
+                "ram_min": min(ram_used),
+                "ram_max": max(ram_used),
+                "ram_avg": sum(ram_used) / len(ram_used),
+            }
+        except Exception as e:
+            logger.warning(f"Error generating memory summary: {e}")
+            return {
+                "duration": 0,
+                "gpu_max": 0,
+                "ram_max": 0,
+                "error": str(e)
+            }
 
 
 def get_nvidia_smi_output() -> str:
@@ -392,14 +475,19 @@ def slice_tensors(tensors: Dict[str, torch.Tensor], slice_size: int) -> List[Dic
     Returns:
         List[Dict[str, torch.Tensor]]: List of sliced tensor dictionaries
     """
-    batch_size = next(iter(tensors.values())).size(0)
-    slices = []
-    
-    for i in range(0, batch_size, slice_size):
-        slice_dict = {k: v[i:i+slice_size] for k, v in tensors.items()}
-        slices.append(slice_dict)
-    
-    return slices
+    try:
+        batch_size = next(iter(tensors.values())).size(0)
+        slices = []
+        
+        for i in range(0, batch_size, slice_size):
+            slice_dict = {k: v[i:i+slice_size] for k, v in tensors.items()}
+            slices.append(slice_dict)
+        
+        return slices
+    except Exception as e:
+        logger.warning(f"Error slicing tensors: {e}")
+        # Return original tensors as a single slice
+        return [tensors]
 
 
 def setup_memory_efficient_attention():
